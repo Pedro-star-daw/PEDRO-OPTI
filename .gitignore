@@ -1,0 +1,264 @@
+import json
+import os
+import shutil
+import subprocess
+import winreg
+from pathlib import Path
+
+APP_NAME = "PEDRO_OPTI"
+APPDATA_LOCAL = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+BACKUP_DIR = APPDATA_LOCAL / APP_NAME
+BACKUP_FILE = BACKUP_DIR / "startup_backup.json"
+
+STARTUP_KEYS = [
+    r"Software\Microsoft\Windows\CurrentVersion\Run",
+    r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+]
+
+
+def ensure_backup_dir():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_reg_read(key_path, value_name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            value, reg_type = winreg.QueryValueEx(key, value_name)
+            return value, reg_type
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, None
+
+
+def list_startup_entries():
+    entries = []
+    for key_path in STARTUP_KEYS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, reg_type = winreg.EnumValue(key, index)
+                        entries.append({
+                            "name": name,
+                            "value": value,
+                            "type": reg_type,
+                            "key_path": key_path,
+                        })
+                        index += 1
+                    except OSError:
+                        break
+        except FileNotFoundError:
+            continue
+    return entries
+
+
+def backup_startup_entries():
+    ensure_backup_dir()
+    entries = list_startup_entries()
+    with open(BACKUP_FILE, "w", encoding="utf-8") as handle:
+        json.dump(entries, handle, indent=2)
+    return {"message": f"Backup created for {len(entries)} startup entries."}
+
+
+def disable_startup_entries(selected_names=None):
+    entries = list_startup_entries()
+    if not entries:
+        return {"message": "No startup entries found."}
+
+    selected = selected_names or [entry["name"] for entry in entries]
+    for entry in entries:
+        name = entry["name"]
+        if name not in selected:
+            continue
+        for key_path in STARTUP_KEYS:
+            if entry["key_path"] != key_path:
+                continue
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+                    try:
+                        winreg.DeleteValue(key, name)
+                    except FileNotFoundError:
+                        pass
+            except FileNotFoundError:
+                continue
+
+    backup_startup_entries()
+    return {"message": f"Disabled {len(selected)} startup entries."}
+
+
+def restore_startup_entries():
+    if not BACKUP_FILE.exists():
+        return {"message": "No startup backup file was found. Nothing to restore."}
+
+    with open(BACKUP_FILE, "r", encoding="utf-8") as handle:
+        entries = json.load(handle)
+
+    for entry in entries:
+        name = entry.get("name")
+        value = entry.get("value")
+        reg_type = entry.get("type", winreg.REG_SZ)
+        key_path = entry.get("key_path")
+
+        if not name or not key_path:
+            continue
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+                try:
+                    winreg.SetValueEx(key, name, 0, reg_type, value)
+                except Exception:
+                    pass
+        except FileNotFoundError:
+            try:
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                    winreg.SetValueEx(key, name, 0, reg_type, value)
+            except Exception:
+                pass
+
+    return {"message": f"Startup entries restored from backup: {len(entries)} items."}
+
+
+def get_cpu_usage():
+    try:
+        result = subprocess.run(
+            ["wmic", "cpu", "get", "LoadPercentage"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            if line.strip().isdigit():
+                return int(line.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def get_memory_usage():
+    try:
+        result = subprocess.run(
+            ["wmic", "OS", "get", "FreePhysicalMemory"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        free_lines = [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
+        if free_lines:
+            free_mb = int(free_lines[0]) / 1024
+            system = subprocess.run(
+                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            total_lines = [line.strip() for line in system.stdout.splitlines() if line.strip().isdigit()]
+            if total_lines:
+                total_mb = int(total_lines[0]) / (1024 * 1024)
+                used = max(0, total_mb - free_mb)
+                return round((used / total_mb) * 100, 1)
+    except Exception:
+        pass
+    return 0
+
+
+def get_disk_usage():
+    try:
+        drive = os.environ.get("SystemDrive", "C:")
+        total, used, _ = shutil.disk_usage(drive)
+        if total:
+            return round((used / total) * 100, 1)
+    except Exception:
+        pass
+    return 0
+
+
+def clean_temp_files():
+    removed = 0
+    temp_locations = [
+        os.environ.get("TEMP", ""),
+        os.path.expanduser(r"~\AppData\Local\Temp"),
+        os.path.expanduser(r"~\AppData\Local\Microsoft\Windows\INetCache"),
+        os.path.expanduser(r"~\AppData\Local\Microsoft\Windows\Temporary Internet Files"),
+    ]
+
+    for directory in temp_locations:
+        if not directory or not os.path.exists(directory):
+            continue
+        for item in os.listdir(directory):
+            full_path = os.path.join(directory, item)
+            try:
+                if os.path.isdir(full_path):
+                    shutil.rmtree(full_path, ignore_errors=True)
+                else:
+                    os.remove(full_path)
+                removed += 1
+            except Exception:
+                pass
+
+    return {"message": f"Temporary files cleaned. Removed: {removed} items."}
+
+
+def flush_dns():
+    try:
+        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, check=False)
+        return {"message": "DNS cache flushed successfully."}
+    except Exception as exc:
+        return {"message": f"DNS flush failed: {exc}"}
+
+
+def optimize_power_plan():
+    try:
+        output = subprocess.run(["powercfg", "/list"], capture_output=True, text=True, check=False)
+        high_perf_guid = None
+        for line in output.stdout.splitlines():
+            if "High performance" in line or "Ultimate Performance" in line:
+                parts = line.split()
+                if parts and parts[0].startswith("Power") and len(parts) > 1:
+                    high_perf_guid = parts[3] if len(parts) > 3 else None
+                break
+        if high_perf_guid:
+            subprocess.run(["powercfg", "/setactive", high_perf_guid], capture_output=True, check=False)
+            return {"message": "High performance power plan activated."}
+        return {"message": "High performance profile was not found. Balanced mode remains active."}
+    except Exception as exc:
+        return {"message": f"Power optimization failed: {exc}"}
+
+
+def optimize_visual_effects():
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects") as key:
+            winreg.SetValueEx(key, "VisualFXSetting", 0, winreg.REG_DWORD, 2)
+
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            try:
+                winreg.SetValueEx(key, "EnableTransparency", 0, winreg.REG_DWORD, 0)
+            except Exception:
+                pass
+
+        return {"message": "Visual effects adjusted for better responsiveness. Some changes apply after sign out or restart."}
+    except Exception as exc:
+        return {"message": f"Visual tweaks could not be applied: {exc}"}
+
+
+def run_all_safe_tweaks():
+    results = [
+        backup_startup_entries(),
+        clean_temp_files(),
+        flush_dns(),
+        optimize_power_plan(),
+        optimize_visual_effects(),
+    ]
+    summary = "\n".join(item["message"] for item in results)
+    return {"message": f"PEDRO OPTI completed all safe tweaks.\n{summary}"}
+
+
+if __name__ == "__main__":
+    print("PEDRO OPTI optimizer module loaded.")
+    print(clean_temp_files())
+    print(flush_dns())
+    print(optimize_power_plan())
+    print(optimize_visual_effects())
+    print(run_all_safe_tweaks())
+    print(list_startup_entries())
